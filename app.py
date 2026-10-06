@@ -1,5 +1,6 @@
 import os
 import time
+import re
 import streamlit as st
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
@@ -9,6 +10,8 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import HumanMessage, AIMessage
 from dotenv import load_dotenv
+from rank_bm25 import BM250kapi
+from langchain_core.documents import Document
 
 load_dotenv()
 
@@ -26,10 +29,50 @@ def load_retriever():
         persist_directory=VECTORSTORE_DIR,
         embedding_function=embeddings
     )
-    return vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": 4}
+    dense_retriever=vectorstore.as_retriever( search_type="similarity",
+    search_Kwargs={"k": 6}
     )
+    data= vectorstore.get(include=["documents","metadatas"])
+    documents =data["documents"]
+    metadatas=data.get("metadatas")or [{} for _ in documents]
+    sparse_documents = [
+        Document(
+            page_content=text,
+            metadata=metadata or {}
+        )
+for text, metadata in zip(documents,metadatas)
+    ]
+    tokenized_documents=[ re.findall(r"\b\w+\b",doc.page_content.lower())
+    for doc in sparse_documents]
+    bm2 = BM250kapi(tokenized_documents)
+    return dense_retriever,sparse_documents,bm25
+def tokenize(text):
+    return re.findall(r"\b\w+\b",text.lower())
+
+def hybrid_search(question,k=4):
+    dense_retriever,sparse_docs,bm25=load_retriever()
+    dense = dense_retriever.invoke(question)
+    scores ={}
+    docs={}
+    sparse_scores=bm25.get_scores(tokenize(question))
+    sparse_idx =sorted(
+        range(len(sparse_scores)),
+        key=lambda i:sparse_scores[i],
+        reverse=True
+    )[:k]
+    results= dense + [sparse_docs[i] for i in sparse_idx]
+    for rank,doc in enumerate(results,start=1):
+        key =doc.page_content.strip()
+        docs[key]=scores.get(key,0)+1/(60+rank)
+        terms =set(tokenize(question))
+        for key,doc in docs.items():
+            matches =len(terms & set (tokenize(doc.page_content)))
+            scores[key] += 0.01 * matches
+            return [
+                docs[key]
+                for key in sorted (scores,key=scores.get,reverse=True)[:k]
+            ]
+
 
 @st.cache_resource(show_spinner=False)
 def load_llm():
@@ -43,11 +86,10 @@ def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
 
 def get_answer(question, chat_history):
-    retriever = load_retriever()
-    llm = load_llm()
 
+    llm = load_llm()
     # Retrieve relevant docs
-    docs = retriever.invoke(question)
+    docs = hybrid_search(question)
     context = format_docs(docs)
     sources = [doc.page_content for doc in docs]
 
